@@ -1,0 +1,416 @@
+import logging
+import os
+import pickle
+import shutil
+import tempfile
+from argparse import ArgumentParser
+from random import shuffle
+from typing import List
+
+import matplotlib.pyplot as plt
+import torch
+import torch.nn as nn
+from morelianoctua.model import OWLOntology
+from morelianoctua.model.axioms.assertionaxiom import OWLClassAssertionAxiom
+from morelianoctua.model.axioms.owldatapropertyaxiom import \
+    OWLDataPropertyRangeAxiom
+from morelianoctua.model.axioms.owlobjectpropertyaxiom import \
+    OWLObjectPropertyRangeAxiom
+from morelianoctua.model.objects.classexpression import OWLClassExpression, \
+    OWLObjectSomeValuesFrom, OWLObjectAllValuesFrom, OWLDataSomeValuesFrom, \
+    OWLDataAllValuesFrom, OWLClass
+from morelianoctua.model.objects.individual import OWLNamedIndividual
+from morelianoctua.parsing.functional import FunctionalSyntaxParser
+from morelianoctua.reasoning.owllinkreasoner import OWLLinkReasoner
+from pykeen.pipeline import pipeline
+from pykeen.triples import TriplesFactory
+from rdflib import Graph
+from sklearn.metrics import accuracy_score
+from torch import optim
+from torch import tensor
+
+from classification import BinaryClassifier, MultiClassClassifier
+from util import StringTripletsBuilder
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+
+def read_examples(examples_file_path: str) -> List[OWLNamedIndividual]:
+    example_individuals = []
+
+    with open(examples_file_path, 'r') as examples_file:
+        for line in examples_file:
+            line = line.strip()
+
+            if line:
+                individual = OWLNamedIndividual(line)
+                example_individuals.append(individual)
+
+    return example_individuals
+
+
+def get_embeddings(rdf_graph: Graph, kb_id: str):
+    logger.info('Computing embeddings...')
+    # first, check cache
+    cache_file_name = f'.cache_{kb_id}_embeddings'
+
+    if os.path.exists(cache_file_name):
+        logger.info(
+            f'Found cache file {cache_file_name}. Loading embeddings from '
+            f'cache...')
+        uris_w_embeddings = pickle.load(open(cache_file_name, 'rb'))
+
+    else:
+        # prepare data
+        tmp_dir = tempfile.mkdtemp()
+        string_triplets_file_path = os.path.join(tmp_dir, 'triplets.tsv')
+        string_triplets_builder = StringTripletsBuilder(rdf_graph)
+        string_triplets_builder.save_string_triplets(string_triplets_file_path)
+
+        # run PyKeen to compute embeddings
+        tf = TriplesFactory(path=string_triplets_file_path)
+
+        training, testing = tf.split()
+
+        logger.info('Running PyKeen...')
+        pykeen_result = pipeline(
+            training=training,
+            testing=testing,
+            model='TransE',
+        )
+
+        entity_id_to_label = \
+            pykeen_result.model.triples_factory.entity_id_to_label
+
+        uris_w_embeddings = string_triplets_builder.get_embeddings_for_uris(
+            pykeen_result.model.entity_embeddings, entity_id_to_label)
+
+        logger.info(f'Writing cache file {cache_file_name}...')
+        pickle.dump(uris_w_embeddings, open(cache_file_name, 'wb'))
+
+        shutil.rmtree(tmp_dir)
+
+    return uris_w_embeddings
+
+
+def train_binary_classifier(
+        pos_examples: List[OWLNamedIndividual],
+        neg_examples: List[OWLNamedIndividual],
+        embeddings_dict: dict,
+        kb_id):
+
+    all_examples = []
+
+    for pos_example in pos_examples:
+        embedding = embeddings_dict[pos_example.iri]
+        all_examples.append((embedding, tensor(1.)))
+
+    for neg_example in neg_examples:
+        embedding = embeddings_dict[neg_example.iri]
+        all_examples.append((embedding, tensor(0.)))
+
+    cache_file_name = f'.cache_{kb_id}_binary_nn'
+
+    if os.path.exists(cache_file_name):
+        logger.info(
+            f'Found cache file {cache_file_name}. Loading binary model from '
+            f'cache...')
+
+        model = BinaryClassifier(input_size=all_examples[0][0].shape[0])
+        model.load_state_dict(torch.load(cache_file_name))
+        model.eval()
+
+    else:
+        logger.info('Training binary classifier...')
+
+        shuffle(all_examples)
+        model = BinaryClassifier(input_size=all_examples[0][0].shape[0])
+
+        loss_fn = nn.NLLLoss()
+        optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+        batch_size = 10
+        num_epochs = 1000
+
+        training_losses = []
+        training_accs = []
+
+        for epoch in range(num_epochs):
+            running_loss = 0
+            running_acc = 0
+            iterations = 0
+
+            for i in range(0, len(all_examples), batch_size):
+                iterations += 1
+                b = i + batch_size
+                batch = all_examples[i:b]
+                X_batch = torch.stack([e[0] for e in batch])
+                y_batch = torch.stack([e[1] for e in batch]).long()
+                # model(example).squeeze() ???
+                raw_predictions = model(X_batch)
+                loss = loss_fn(raw_predictions, y_batch)
+
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                running_loss += loss.item()
+
+                _, pred_classes = torch.exp(raw_predictions).topk(1, dim=1)
+                acc = accuracy_score(y_batch, pred_classes)
+                running_acc += acc
+
+            training_losses.append(running_loss / iterations)
+            training_accs.append(running_acc / iterations)
+
+        plt.plot(training_losses, label='Training loss')
+        plt.plot(training_accs, label='Training accuracies')
+        plt.legend(frameon=False)
+        plt.savefig('binary_classifier_loss.svg', format='svg')
+
+        torch.save(model.state_dict(), cache_file_name)
+
+    return model
+
+
+def build_relevant_class_expressions(reasoner: OWLLinkReasoner) \
+        -> List[OWLClassExpression]:
+
+    ces: List[OWLClassExpression] = []
+
+    # atomic classes
+    atomic_classes = reasoner.get_all_classes()
+    ces += atomic_classes
+
+    obj_properties = reasoner.get_object_properties()
+
+    # existential and universal restrictions on object properties
+    for obj_property in obj_properties:
+        for atomic_class in atomic_classes:
+            if reasoner.is_entailed(
+                    OWLObjectPropertyRangeAxiom(obj_property, atomic_class)):
+
+                ces.append(OWLObjectSomeValuesFrom(obj_property, atomic_class))
+                ces.append(OWLObjectAllValuesFrom(obj_property, atomic_class))
+
+    data_properties = reasoner.get_data_properties()
+    data_ranges = reasoner.get_all_datatypes()
+
+    # existential and universal restrictions on data properties
+    for data_property in data_properties:
+        for data_range in data_ranges:
+            if reasoner.is_entailed(
+                    OWLDataPropertyRangeAxiom(data_property, data_range)):
+
+                ces.append(OWLDataSomeValuesFrom(data_property, data_range))
+                ces.append(OWLDataAllValuesFrom(data_property, data_range))
+
+    return ces
+
+
+def retrain_model_on_ces(
+        model,
+        pos_examples: List[OWLNamedIndividual],
+        neg_examples: List[OWLNamedIndividual],
+        embeddings: dict,
+        reasoner: OWLLinkReasoner,
+        class_expressions: List[OWLClassExpression]):
+
+    model_2 = MultiClassClassifier(
+        model.hidden_1, model.hidden_2, model.hidden_3, len(class_expressions))
+
+    all_example_individuals = pos_examples[:]
+    all_example_individuals += neg_examples
+
+    shuffle(all_example_individuals)
+
+    logger.info('Getting type vectors for examples')
+    example_uri_vectors = []
+
+    for example_individual in all_example_individuals:
+        is_instance_of_vec = []
+        for ce in class_expressions:
+            if reasoner.is_entailed(
+                    OWLClassAssertionAxiom(example_individual, ce)):
+                is_instance_of_vec.append(1)
+            else:
+                is_instance_of_vec.append(0)
+
+        example_uri_vectors.append(torch.tensor(is_instance_of_vec).long())
+
+    loss_fn2 = nn.BCEWithLogitsLoss()
+    optimizer2 = optim.SGD(model_2.parameters(), lr=0.01)
+    num_epochs = 1000
+    training_losses = []
+
+    logger.info('Training ce mapping network...')
+    for epoch in range(num_epochs):
+        running_loss = 0
+        iterations = 0
+        i = 0
+
+        for example_individual in all_example_individuals:
+            iterations += 1
+
+            embedding = embeddings[example_individual.iri]
+            classes_vec = example_uri_vectors[i]
+
+            raw_predictions = model_2(embedding)
+            loss = loss_fn2(raw_predictions, classes_vec.float())
+
+            optimizer2.zero_grad()
+            loss.backward()
+            optimizer2.step()
+
+            running_loss += loss.item()
+            i += 1
+
+        training_losses.append(running_loss / iterations)
+
+    plt.plot(training_losses, label='Training loss')
+    plt.legend(frameon=False)
+    plt.savefig('multi_class_classifier_loss.svg', format='svg')
+
+    return model_2
+
+
+def plot_ce_predictions(
+        pos_examples: List[OWLNamedIndividual],
+        neg_examples: List[OWLNamedIndividual],
+        embeddings: dict,
+        model2,
+        ces: List[OWLClassExpression]):
+
+    sums = [0.0] * len(ces)
+    for pos_example in pos_examples:
+        embedding = embeddings[pos_example.iri]
+
+        raw_predictions = model2(embedding)
+
+        for i in range(len(ces)):
+            sums[i] += raw_predictions[i].data.tolist()
+
+    for neg_example in neg_examples:
+        embedding = embeddings[neg_example.iri]
+
+        raw_predictions = model2(embedding)
+
+        for i in range(len(ces)):
+            raw_prediction = raw_predictions[i].data.tolist()
+            if raw_prediction > 0:
+                sums[i] -= raw_prediction
+
+    def to_str(ce: OWLClassExpression):
+        if isinstance(ce, OWLClass):
+            return str(str(ce.iri).rsplit("/", 1)[-1])
+
+        elif isinstance(ce, OWLObjectSomeValuesFrom):
+            return f'{str(ce.owl_property.iri).rsplit("/", 1)[-1]} some ' \
+                f'{to_str(ce.filler)}'
+
+        elif isinstance(ce, OWLDataSomeValuesFrom):
+            return f'{str(ce.property.iri).rsplit("/", 1)[-1]} some ' \
+                f'{str(ce.filler.iri).rsplit("/", 1)[-1]}'
+
+        elif isinstance(ce, OWLObjectAllValuesFrom):
+            return f'{str(ce.property.iri).rsplit("/", 1)[-1]} all ' \
+                f'{to_str(ce.filler)}'
+
+        elif isinstance(ce, OWLDataAllValuesFrom):
+            return f'{str(ce.property.iri).rsplit("/", 1)[-1]} all ' \
+                f'{str(ce.filler.iri).rsplit("/", 1)[-1]}'
+
+        else:
+            raise Exception(f'CE {ce} not supported')
+
+    ce_labels = [l for l in map(lambda ce: to_str(ce), ces)]
+    avgs = [s / len(pos_examples) for s in sums]
+
+    cleaned_ce_labels = []
+    cleaned_avgs = []
+
+    for i in range(len(avgs)):
+        avg = avgs[i]
+
+        if avg > 0:
+            cleaned_ce_labels.append(ce_labels[i])
+            cleaned_avgs.append(avg)
+
+    plt.bar(cleaned_ce_labels, cleaned_avgs)
+    plt.bar(ce_labels, avgs)
+    plt.xticks(rotation=90)
+    plt.savefig('ce_importance.svg', format='svg')
+
+
+def main(
+        kb_path: str,
+        kb_id: str,
+        pos_examples_path: str,
+        neg_examples_path: str,
+        owllink_server_url: str = 'http://localhost:8383'):
+
+    logger.info('Loading ontology...')
+    ontology: OWLOntology = FunctionalSyntaxParser().parse_file(kb_path)
+    reasoner = OWLLinkReasoner(ontology, owllink_server_url)
+
+    logger.info('Creating RDF graph...')
+    rdf_graph: Graph = ontology.as_rdf_graph()
+
+    logger.info('Loading examples...')
+    pos_examples: List[OWLNamedIndividual] = read_examples(pos_examples_path)
+    neg_examples: List[OWLNamedIndividual] = read_examples(neg_examples_path)
+
+    embeddings = get_embeddings(rdf_graph, kb_id)
+
+    model: BinaryClassifier = \
+        train_binary_classifier(pos_examples, neg_examples, embeddings, kb_id)
+
+    class_expressions = build_relevant_class_expressions(reasoner)
+
+    retrained_model = retrain_model_on_ces(
+        model,
+        pos_examples,
+        neg_examples,
+        embeddings,
+        reasoner,
+        class_expressions)
+
+    plot_ce_predictions(
+        pos_examples,
+        neg_examples,
+        embeddings,
+        retrained_model,
+        class_expressions)
+
+    # import pdb; pdb.set_trace()
+    # pass
+
+
+if __name__ == '__main__':
+    arg_parser = ArgumentParser()
+    arg_parser.add_argument('kb_path')
+    arg_parser.add_argument('kb_id', help='used for caching purposes')
+    arg_parser.add_argument('pos_examples_path')
+    arg_parser.add_argument('neg_examples_path')
+    arg_parser.add_argument('--owllink_server_url')
+
+    args = arg_parser.parse_args()
+
+    kb_path = args.kb_path
+    kb_id = args.kb_id
+    pos_examples_path = args.pos_examples_path
+    neg_examples_path = args.neg_examples_path
+    owllink_server_url = args.owllink_server_url
+
+    if owllink_server_url is None:
+        main(kb_path, kb_id, pos_examples_path, neg_examples_path)
+    else:
+        main(
+            kb_path,
+            kb_id,
+            pos_examples_path,
+            neg_examples_path,
+            owllink_server_url)
+
+    exit(0)
